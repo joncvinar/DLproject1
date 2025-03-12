@@ -1,36 +1,91 @@
-#Model has 4178042 parameters
-import ssl
-import certifi
-ssl._create_default_https_context = ssl._create_unverified_context
-
+import numpy as np
+import pandas as pd
+import os
+import pickle
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchvision
 import torchvision.transforms as transforms
-from torchsummary import summary
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader, random_split, TensorDataset
+from torch.optim.lr_scheduler import StepLR, MultiStepLR
+from PIL import Image
+import torch.optim.lr_scheduler as lr_scheduler
 import matplotlib.pyplot as plt
-import numpy as np
-import time
-import sys
 
 
-def get_dataloaders(batch_size=128):
-    transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, padding=4),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))
-    ])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
+def load_cifar_batch(file):
+    with open(file, 'rb') as fo:
+        dict = pickle.load(fo, encoding='bytes')
+    return dict
 
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
+cifar10_dir = '/kaggle/input/dl-project-1/deep-learning-spring-2025-project-1/cifar-10-python/cifar-10-batches-py'
 
-    return trainloader, testloader
+meta_data_dict = load_cifar_batch(os.path.join(cifar10_dir, 'batches.meta'))
+label_names = [label.decode('utf-8') for label in meta_data_dict[b'label_names']]
 
+train_data = []
+train_labels = []
+for i in range(1, 6):
+    batch = load_cifar_batch(os.path.join(cifar10_dir, f'data_batch_{i}'))
+    train_data.append(batch[b'data'])
+    train_labels += batch[b'labels']
+
+train_data = np.vstack(train_data).reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
+train_labels = np.array(train_labels)
+
+transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.2),
+    transforms.RandomCrop(32, padding=4),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.1), value=1.0, inplace=False)
+])
+
+class CustomCIFAR10Dataset(torch.utils.data.Dataset):
+    def __init__(self, images, labels, transform=None):
+        self.images = images
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        label = self.labels[idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+train_dataset = CustomCIFAR10Dataset(train_data, train_labels, transform=transform)
+
+test_transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+])
+
+batch_test_dict = load_cifar_batch(os.path.join(cifar10_dir, 'test_batch'))
+val_images = batch_test_dict[b'data'].reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
+val_labels = np.array(batch_test_dict[b'labels'])
+val_dataset = CustomCIFAR10Dataset(val_images, val_labels, transform=test_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
+
+cifar_test_path = '/kaggle/input/dl-project-1/deep-learning-spring-2025-project-1/cifar_test_nolabel.pkl'
+test_batch = load_cifar_batch(cifar_test_path)
+test_images = test_batch[b'data'].astype(np.float32) / 255.0
+test_dataset = [(test_transform(img),) for img in test_images]
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=4)
 
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -40,16 +95,16 @@ class ResidualBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-
         self.skip = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.skip = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels)
             )
-
     def forward(self, x):
-        identity = self.skip(x)
+        identity = x 
+        if self.skip:
+            identity = self.skip(x)
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
@@ -59,91 +114,29 @@ class ResidualBlock(nn.Module):
         out = self.relu(out)
         return out
 
+model = CustomResNet().to(device)
 
-class CustomResNet(nn.Module):
-    def __init__(self, num_classes=10):
-        super(CustomResNet, self).__init__()
-        self.in_channels = 48  # Adjust initial channels
-        self.conv1 = nn.Conv2d(3, 48, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(48)
-        self.relu = nn.ReLU(inplace=True)
+from torchsummary import summary
+summary(model, (3, 32, 32))
 
-        self.layer1 = self._make_layer(64, 2, stride=1)
-        self.layer2 = self._make_layer(128, 2, stride=2)
-        self.layer3 = self._make_layer(192, 2, stride=2)
-        self.layer4 = self._make_layer(256, 2, stride=2)  # Adjusted depth
+model.eval()
+image_ids = []
+predictions = []
 
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(256, num_classes)  # Reduced FC layer size
+test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=4)
 
-    def _make_layer(self, out_channels, blocks, stride):
-        layers = []
-        layers.append(ResidualBlock(self.in_channels, out_channels, stride))
-        self.in_channels = out_channels
-        for _ in range(1, blocks):
-            layers.append(ResidualBlock(out_channels, out_channels, stride=1))
-        return nn.Sequential(*layers)
+with torch.no_grad():
+    for batch_idx, (images,) in enumerate(test_loader):
+        images = images.to(device)  
+        outputs = model(images)  
+        _, predicted = torch.max(outputs, 1)
+        
+        for i in range(len(images)):
+            image_id = batch_idx * test_loader.batch_size + i
+            image_ids.append(image_id)
+            predictions.append(predicted[i].item())
 
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
-
-
-def train_model(model, trainloader, testloader, epochs=20, lr=0.01):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-
-    for epoch in range(epochs):
-        start_time = time.time()
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        for batch_idx, (inputs, labels) in enumerate(trainloader):
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch + 1}/{epochs}, Batch {batch_idx}/{len(trainloader)}, Loss: {loss.item():.4f}")
-                sys.stdout.flush()
-
-        scheduler.step()
-        epoch_time = time.time() - start_time
-        print(
-            f"Epoch {epoch + 1}/{epochs} completed in {epoch_time:.2f} seconds - Loss: {running_loss / len(trainloader):.4f}, Accuracy: {100. * correct / total:.2f}%")
-        sys.stdout.flush()
-
-    print("Training Complete")
-
-
-def main():
-    trainloader, testloader = get_dataloaders()
-    model = CustomResNet(num_classes=10)
-    print(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad)} parameters")
-    train_model(model, trainloader, testloader, epochs=20, lr=0.01)
-
-
-if __name__ == "__main__":
-    main()
+submission_df = pd.DataFrame({'ID': image_ids, 'Labels': predictions})
+submission_df = submission_df.sort_values(by="ID")
+submission_df.to_csv('/kaggle/working/submission.csv', index=False)
+print("Submission file saved successfully as 'submission.csv'.")
